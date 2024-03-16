@@ -15,25 +15,23 @@ mod server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
-    tracing_subscriber::fmt::init();
+  dotenvy::dotenv().ok();
+  tracing_subscriber::fmt::init();
 
-    let client = client::Client::from_conf(
-        r#"
+  let client = client::Client::from_conf(r#"
     nameserver 1.1.1.1
     nameserver 8.8.8.8
-  "#,
-    )?;
-    let authority = server::CheckedAuthority::new(Arc::new(client));
-    let authority = Arc::new(authority);
-    AuthorityObject::box_clone(&authority);
+  "#)?;
+  let authority = server::CheckedAuthority::new(Arc::new(client));
+  let authority = Arc::new(authority);
+  AuthorityObject::box_clone(&authority);
 
-    let listener = tokio::net::UdpSocket::bind("0.0.0.0:5553").await?;
-    let mut catalog = Catalog::new();
-    catalog.upsert(LowerName::new(&Name::root()), Box::new(authority));
-    let mut server_future = ServerFuture::new(catalog);
-    info!("listen on udp={}", listener.local_addr()?);
-    server_future.register_socket(listener);
-    server_future.block_until_done().await?;
-    Ok(())
+  let listener = tokio::net::UdpSocket::bind("0.0.0.0:5553").await?;
+  let mut catalog = Catalog::new();
+  catalog.upsert(LowerName::new(&Name::root()), Box::new(authority));
+  let mut server_future = ServerFuture::new(catalog);
+  info!("listen on udp={}", listener.local_addr()?);
+  server_future.register_socket(listener);
+  server_future.block_until_done().await?;
+  Ok(())
 }

@@ -1,57 +1,89 @@
 use std::sync::Arc;
 
-use hickory_server::{authority::{Authority, MessageResponseBuilder, ZoneType}, proto::op::{message, Header, ResponseCode}, server::{Request, RequestHandler, ResponseHandler, ResponseInfo}, store::in_memory::InMemoryAuthority};
+use hickory_server::authority::{Authority, LookupError, LookupObject, LookupOptions, MessageRequest, UpdateResult, ZoneType};
+use hickory_server::proto::rr::{LowerName, Record, RecordType};
+use hickory_server::resolver::{lookup::Lookup, Name};
+use hickory_server::server::RequestInfo;
 
 use crate::client::Client;
 
 /// DNS Request Handler
-#[derive(Clone, Debug)]
-pub struct Handler {
+pub struct CheckedAuthority {
+  origin: LowerName,
   client: Arc<Client>,
 }
 
-impl Handler {
+impl CheckedAuthority {
   /// Create a new Server with the given client
   pub fn new(client: Arc<Client>) -> Self {
-    Self { client }
+    let origin = LowerName::new(&Name::root());
+    Self { client, origin }
   }
 }
 
-// fn get_domain_from_request(request: &Request) -> Option<String> {
-//   match request {
-//     Request::A { domain, .. } => Some(domain.clone()),
-//     Request::AAAA { domain, .. } => Some(domain.clone()),
-//     Request::PTR { domain, .. } => Some(domain.clone()),
-//     Request::TXT { domain, .. } => Some(domain.clone()),
-//     Request::MX { domain, .. } => Some(domain.clone()),
-//     Request::NS { domain, .. } => Some(domain.clone()),
-//     Request::SOA { domain, .. } => Some(domain.clone()),
-//     Request::SRV { domain, .. } => Some(domain.clone()),
-//     Request::ANY { domain, .. } => Some(domain.clone()),
-//     _ => None,
-//   }
-// }
-
 #[async_trait::async_trait]
-impl RequestHandler for Handler {
-  async fn handle_request<R: ResponseHandler>(
+impl Authority for CheckedAuthority {
+  type Lookup = LookupResult;
+  fn zone_type(&self) -> ZoneType {
+    ZoneType::Secondary
+  }
+
+  fn is_axfr_allowed(&self) -> bool {
+    false
+  }
+
+  async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
+    Ok(false)
+  }
+
+  fn origin(&self) -> &LowerName {
+    &self.origin
+  }
+
+  async fn lookup(
     &self,
-    request: &Request,
-    response: R,
-  ) -> ResponseInfo {
-    debug!("Handling request: {:?}", request);
-    let id = request.header().id();
-    let domain = request.query().name().to_string();
-    info!("Resolving domain: [{id}] {}", domain);
-    let lookup_resp = self.client.resolve(&domain, request.query().query_type()).await.unwrap();
-    let builder = MessageResponseBuilder::from_message_request(&request);
-    for record in lookup_resp.iter() {
-      debug!("{}: {}", domain, record);
-    }
-    // response.send_response(message).await;
-    let mut header = Header::new();
-    header.set_response_code(ResponseCode::ServFail);
-    ResponseInfo::from(header)
+    name: &LowerName,
+    rtype: RecordType,
+    _lookup_options: LookupOptions,
+  ) -> Result<Self::Lookup, LookupError> {
+    let result = self.client.resolve(&name.to_string(), rtype).await?;
+    Ok(LookupResult(result))
+  }
+
+  async fn search(
+    &self,
+    request: RequestInfo<'_>,
+    lookup_options: LookupOptions,
+  ) -> Result<Self::Lookup, LookupError> {
+    info!("search: {:?}", request.query);
+    let result = self.lookup(request.query.name(), RecordType::A, lookup_options).await?;
+    Ok(result)
+  }
+
+  async fn get_nsec_records(
+    &self,
+    name: &LowerName,
+    lookup_options: LookupOptions,
+  ) -> Result<Self::Lookup, LookupError> {
+    info!("get_nsec_records: {}", name);
+    let result = self.lookup(name, RecordType::NSEC, lookup_options).await?;
+    Ok(result)
+  }
+}
+
+pub struct LookupResult(Lookup);
+
+impl LookupObject for LookupResult {
+  fn is_empty(&self) -> bool {
+    self.0.records().is_empty()
+  }
+
+  fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Record> + Send + 'a> {
+    Box::new(self.0.record_iter())
+  }
+
+  fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
+    None
   }
 }
 

@@ -58,7 +58,9 @@ impl Authority for CheckedAuthority {
     rtype: RecordType,
     _lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
+    let now = tokio::time::Instant::now();
     let result = self.client.resolve(&name.to_string(), rtype).await?;
+    debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
     Ok(LookupResult(result))
   }
 
@@ -67,7 +69,7 @@ impl Authority for CheckedAuthority {
     request: RequestInfo<'_>,
     lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
-    info!("search: {:?}", request.query);
+    let _span = info_span!("search", name=%request.query.name(), rtype=?request.query.query_type()); let _span = _span.enter();
     let result = self.lookup(request.query.name(), RecordType::A, lookup_options).await?;
     Ok(result)
   }
@@ -77,7 +79,7 @@ impl Authority for CheckedAuthority {
     name: &LowerName,
     lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
-    info!("get_nsec_records: {}", name);
+    info!(func="get_nsec_records", %name);
     let result = self.lookup(name, RecordType::NSEC, lookup_options).await?;
     Ok(result)
   }
@@ -102,37 +104,48 @@ impl LookupObject for LookupResult {
 
 pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>) {
   // let mut udp = HashMap::new();
+  let mut handles = Vec::new();
   while let Some(packet) = receiver.recv().await {
-    match packet {
-      Packet::Udp { local_addr, remote_addr, buffer } => {
-        debug!("[memory] sending {local_addr} {remote_addr} len={}", buffer.len());
-        debug!("buffer: {:02x?}", buffer);
-        let socket = tokio::net::UdpSocket::bind(local_addr).await.unwrap();
-        socket.send_to(&buffer, remote_addr).await.unwrap();
-        let mut out_buf = vec![0; 4096];
-        let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
-        let mut decided = None;
-        loop {
-          let sleep = tokio::time::sleep_until(until);
-          tokio::select! {
-          _ = sleep => {
-            warn!("[memory] finished");
-            break;
-          }
-          _ = socket.readable() => {
-            if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
-              debug!("[memory] receiving {new_addr} {local_addr} len={}", len);
-              let out_buf = out_buf[..len].to_owned();
-              debug!("buffer: {:02x?}", out_buf);
-              decided = Some(out_buf);
-            }
-          }
-        } }
-        if let Some(out_buf) = decided {
-          sender.send(Packet::Udp { local_addr, remote_addr, buffer: out_buf }).await.unwrap();
-        }
-      },
+    let handle = tokio::spawn(udp_handle(packet, sender.clone()));
+    handles.push(handle);
+    handles = handles.into_iter().filter(|i| !i.is_finished()).collect();
+    if handles.len() > 5 {
+      warn!(handles.len=handles.len())
     }
+  }
+}
+
+async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>) {
+  match packet {
+    Packet::Udp { local_addr, remote_addr, buffer } => {
+      let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
+      trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
+      let socket = tokio::net::UdpSocket::bind(local_addr).await.unwrap();
+      socket.send_to(&buffer, remote_addr).await.unwrap();
+      let mut out_buf = vec![0; 4096];
+      let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+      let mut decided = None;
+      let mut found = 0;
+      loop {
+        let sleep = tokio::time::sleep_until(until);
+        tokio::select! {
+        _ = sleep => {
+          info!(name: "finished", respone_found=found);
+          break;
+        }
+        _ = socket.readable() => {
+          if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
+            trace!(name: "receiving", %new_addr, %local_addr, len);
+            let out_buf = out_buf[..len].to_owned();
+            decided = Some(out_buf);
+            found += 1;
+          }
+        }
+      } }
+      if let Some(out_buf) = decided {
+        sender.send(Packet::Udp { local_addr, remote_addr, buffer: out_buf }).await.unwrap();
+      }
+    },
   }
 }
 

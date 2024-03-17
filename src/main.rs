@@ -21,7 +21,10 @@ async fn main() -> anyhow::Result<()> {
   info!("parsed opts: {:?}", conf.1);
   let authority = server::CheckedAuthority::new(conf);
 
-  let listener = tokio::net::UdpSocket::bind("0.0.0.0:5553").await?;
+  let listen_addr = std::env::var("DNSD_LISTEN").unwrap_or("0.0.0.0:5553".to_string());
+  info!("DNSD_LISTEN={:?}", listen_addr);
+
+  let listener = tokio::net::UdpSocket::bind(listen_addr).await?;
   let mut catalog = Catalog::new();
   catalog.upsert(LowerName::new(&Name::root()), authority.to_boxed());
   let mut server_future = ServerFuture::new(catalog);

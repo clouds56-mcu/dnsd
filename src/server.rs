@@ -16,7 +16,9 @@ pub struct Statistics {
   pub queries: AtomicU64,
   pub success: AtomicU64,
   pub failed: AtomicU64,
+  pub empty: AtomicU64,
   pub memory_recv: AtomicU64,
+  pub memory_failed: AtomicU64,
   pub memory_sent: AtomicU64,
 }
 
@@ -73,7 +75,12 @@ impl Authority for CheckedAuthority {
   ) -> Result<Self::Lookup, LookupError> {
     let now = tokio::time::Instant::now();
     let result = self.client.resolve(&name.to_string(), rtype).await?;
-    debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
+    if result.records().is_empty() {
+      self.stats.empty.fetch_add(1, Ordering::Relaxed);
+      info!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
+    } else {
+      debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), record=%result.records()[0], elapsed=%now.elapsed().as_millis());
+    }
     Ok(LookupResult(result))
   }
 
@@ -88,9 +95,6 @@ impl Authority for CheckedAuthority {
       self.stats.failed.fetch_add(1, Ordering::Relaxed); e
     })?;
     self.stats.success.fetch_add(1, Ordering::Relaxed);
-    if rand::random::<f64>() < 0.10 {
-      info!(stats=?self.stats);
-    }
     Ok(result)
   }
 
@@ -124,49 +128,76 @@ impl LookupObject for LookupResult {
 
 pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>, stats: Arc<Statistics>) {
   // let mut udp = HashMap::new();
+  let mut last_handles_report = tokio::time::Instant::now();
   let mut handles = Vec::new();
   while let Some(packet) = receiver.recv().await {
     let handle = tokio::spawn(udp_handle(packet, sender.clone(), stats.clone()));
     handles.push(handle);
     handles = handles.into_iter().filter(|i| !i.is_finished()).collect();
-    if handles.len() > 5 {
-      warn!(handles.len=handles.len())
+    if last_handles_report.elapsed() > Duration::from_secs(5) {
+      let pending = stats.queries.load(Ordering::Relaxed).saturating_sub(stats.success.load(Ordering::Relaxed)).saturating_sub(stats.failed.load(Ordering::Relaxed));
+      last_handles_report = tokio::time::Instant::now();
+      if handles.len() > 5 {
+        warn!(handles.len=handles.len(), pending, ?stats)
+      } else {
+        info!(handles.len=handles.len(), pending, ?stats)
+      }
+    } else {
+      trace!(handles.len=handles.len())
     }
   }
 }
 
-async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>, stats: Arc<Statistics>) {
-  match packet {
-    Packet::Udp { local_addr, remote_addr, buffer } => {
-      stats.memory_recv.fetch_add(1, Ordering::Relaxed);
-      let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
-      trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
-      let socket = tokio::net::UdpSocket::bind(local_addr).await.unwrap();
-      socket.send_to(&buffer, remote_addr).await.unwrap();
-      let mut out_buf = vec![0; 4096];
-      let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
-      let mut decided = None;
-      let mut found = 0;
-      loop {
-        let sleep = tokio::time::sleep_until(until);
-        tokio::select! {
-        _ = sleep => {
-          info!(name: "finished", respone_found=found);
-          break;
+async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>, stats: Arc<Statistics>) -> () {
+  let mut decided = None;
+  let packet = 'failed: loop {
+    match packet {
+      Packet::Udp { local_addr, remote_addr, buffer } => {
+        stats.memory_recv.fetch_add(1, Ordering::Relaxed);
+        let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
+        trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
+        let Ok(socket) = tokio::net::UdpSocket::bind(local_addr).await else {
+          break 'failed Packet::Udp { local_addr, remote_addr, buffer: vec![] };
+        };
+        if socket.send_to(&buffer, remote_addr).await.is_err() {
+          break 'failed Packet::Udp { local_addr, remote_addr, buffer: vec![] };
         }
-        _ = socket.readable() => {
-          if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
-            trace!(name: "receiving", %new_addr, %local_addr, len);
-            let out_buf = out_buf[..len].to_owned();
-            decided = Some(out_buf);
-            found += 1;
+        let mut out_buf = vec![0; 4096];
+        let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+
+        let mut found = 0;
+        loop {
+          let sleep = tokio::time::sleep_until(until);
+          tokio::select! {
+            _ = sleep => {
+              if found > 1 {
+                info!(name: "finished", response_found=found);
+              }
+              trace!(name: "time up", response_found=found, overtime_ms=until.elapsed().as_millis());
+              break;
+            }
+            _ = socket.readable() => {
+              if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
+                trace!(name: "receiving", %new_addr, %local_addr, len);
+                let out_buf = out_buf[..len].to_owned();
+                decided = Some(out_buf);
+                found += 1;
+              }
+            }
           }
         }
-      } }
-      sender.send(Packet::Udp { local_addr, remote_addr, buffer: decided.unwrap_or_default() }).await.unwrap();
-      stats.memory_sent.fetch_add(1, Ordering::Relaxed);
-    },
-  }
+        if sender.send(Packet::Udp { local_addr, remote_addr, buffer: decided.unwrap_or_default() }).await.is_err() {
+          stats.memory_sent.fetch_add(1, Ordering::Relaxed);
+          return;
+        }
+        stats.memory_sent.fetch_add(1, Ordering::Relaxed);
+      },
+    }
+
+    return;
+  };
+  stats.memory_failed.fetch_add(1, Ordering::Relaxed);
+  sender.send(packet).await.ok();
 }
 
 #[cfg(test)]

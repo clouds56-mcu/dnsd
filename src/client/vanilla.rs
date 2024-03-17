@@ -45,7 +45,7 @@ impl<P: ConnectionProvider> Client<P> {
   ) -> Result<Lookup, ResolveError> {
     let response = self.resolver.lookup(domain, record_type).await?;
     for i in response.record_iter() {
-      debug!("resolve {}: {}", domain, i);
+      trace!("resolve {}: {}", domain, i);
     }
     Ok(response)
   }

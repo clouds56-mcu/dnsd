@@ -22,17 +22,20 @@ impl<P: ConnectionProvider> std::fmt::Debug for Client<P> {
 }
 
 impl<P: ConnectionProvider> Client<P> {
-  pub fn from_conf(conf: &str, provider: P) -> Result<Self> {
-    let (config, options) = parse_resolv_conf(conf.as_bytes())?;
+  pub fn new(config: (ResolverConfig, ResolverOpts), provider: P) -> Self {
     let resolver = AsyncResolver::new(
-      config.clone(),
-      options.clone(),
+      config.0.clone(),
+      config.1.clone(),
       provider,
     );
-    Ok(Self {
-      config: (config, options),
+    Self {
+      config,
       resolver,
-    })
+    }
+  }
+  pub fn from_conf(conf: &str, provider: P) -> Result<Self> {
+    let config = parse_resolv_conf(conf.as_bytes())?;
+    Ok(Self::new(config, provider))
   }
 
   pub async fn resolve(

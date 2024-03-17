@@ -1,11 +1,11 @@
 // https://github.com/hickory-dns/hickory-dns/issues/1669
 
-use std::{collections::{HashMap, VecDeque}, io, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, task::{ready, Context, Poll}};
+use std::{collections::{HashMap, VecDeque}, io::{self, Write}, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, task::{ready, Context, Poll}};
 
 use hickory_server::{proto::{self, udp::UdpSocket as _, TokioTime}, resolver::{name_server::{GenericConnector, RuntimeProvider, Spawn}, TokioHandle}};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
-pub type MemoryState = HashMap<(SocketAddr, SocketAddr), VecDeque<Packet>>;
+pub type MemoryState = HashMap<SocketAddr, Mutex<VecDeque<Packet>>>;
 
 #[derive(Clone)]
 pub struct MemoryRuntime {
@@ -30,15 +30,17 @@ impl MemoryRuntime {
 
   pub fn sync(mut handle: TokioHandle, mut channel: mpsc::Receiver<Packet>, state: Arc<RwLock<MemoryState>>) {
     handle.spawn_bg(async move {
+      info!("backgroud sync running");
       while let Some(packet) = channel.recv().await {
+        debug!("memory::sync: package arrived");
         let mut state = state.write().await;
         let entry = match packet {
           Packet::Udp { local_addr, remote_addr, .. } => {
-            debug!("receiving from {} {}", local_addr, remote_addr);
-            state.entry((local_addr, remote_addr))
+            debug!("memory::sync: receiving from {} {}", local_addr, remote_addr);
+            state.entry(local_addr)
           }
         };
-        entry.or_default().push_back(packet)
+        entry.or_default().lock().await.push_back(packet);
       }
       Ok(())
     })
@@ -75,7 +77,7 @@ pub enum Packet {
 
 
 pub struct UdpSocket {
-  raw: tokio::net::UdpSocket,
+  addr: SocketAddr,
   sender: mpsc::Sender<Packet>,
   // receiver: mpsc::Receiver<Packet>,
   received: Arc<RwLock<MemoryState>>,
@@ -84,7 +86,7 @@ pub struct UdpSocket {
 impl UdpSocket {
   pub async fn new(addr: SocketAddr, sender: mpsc::Sender<Packet>, received: Arc<RwLock<MemoryState>>) -> io::Result<Self> {
     Ok(Self {
-      raw: tokio::net::UdpSocket::bind(addr).await?, sender, received
+      addr, sender, received,
     })
   }
 }
@@ -108,9 +110,9 @@ impl proto::udp::UdpSocket for UdpSocket {
 
   async fn bind(addr: SocketAddr) -> io::Result<Self> {
     Ok(UdpSocket {
-      raw: tokio::net::UdpSocket::bind(addr).await?,
       sender: todo!(),
       received: todo!(),
+      addr: todo!(),
     })
   }
 }
@@ -120,14 +122,38 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
   type Time = proto::TokioTime;
 
   fn poll_recv_from(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<(usize, SocketAddr)>> {
-    let mut buf = tokio::io::ReadBuf::new(buf);
-    let addr = ready!(self.raw.poll_recv_from(cx, &mut buf))?;
-    let len = buf.filled().len();
+    // let mut buf = tokio::io::ReadBuf::new(buf);
+    // let addr = ready!(self.raw.poll_recv_from(cx, &mut buf))?;
+    // let len = buf.filled().len();
 
-    Poll::Ready(Ok((len, addr)))
+    // Poll::Ready(Ok((len, addr)))
+    todo!()
+  }
+
+  async fn recv_from(&self, mut buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    loop {
+      let state = self.received.read().await;
+      if let Some(entry) = state.get(&self.addr) {
+        if let Some(item) = entry.lock().await.pop_front() {
+          match item {
+            Packet::Udp { local_addr, remote_addr, buffer } => {
+              buf.write_all(&buffer)?;
+              return Ok((buffer.len(), remote_addr))
+            },
+          }
+        }
+      }
+    }
   }
 
   fn poll_send_to(&self, cx: &mut Context<'_>, buf: &[u8], target: SocketAddr) -> Poll<io::Result<usize>> {
-    self.raw.poll_send_to(cx, buf, target)
+    // self.raw.poll_send_to(cx, buf, target)
+    todo!();
+  }
+
+  async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+    info!("UdpSocket::send_to {target} len={}", buf.len());
+    self.sender.send(Packet::Udp { local_addr: self.addr, remote_addr: target, buffer: buf.to_owned() }).await.map_err(|_| io::ErrorKind::UnexpectedEof)?;
+    Ok(buf.len())
   }
 }

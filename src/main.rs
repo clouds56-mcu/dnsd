@@ -18,10 +18,10 @@ async fn main() -> anyhow::Result<()> {
   dotenvy::dotenv().ok();
   tracing_subscriber::fmt::init();
 
-  let client = client::Client::from_conf(r#"
+  let client = client::Vanilla::from_conf(r#"
     nameserver 1.1.1.1
     nameserver 8.8.8.8
-  "#)?;
+  "#, client::TimeWindowUdpProvider::new())?;
   let authority = server::CheckedAuthority::new(Arc::new(client));
   let authority = Arc::new(authority);
   AuthorityObject::box_clone(&authority);

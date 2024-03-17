@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +11,21 @@ use hickory_server::server::RequestInfo;
 use crate::client::memory_rt::Packet;
 use crate::client::{self, MemoryClient, MemoryRuntime};
 
+#[derive(Debug, Default)]
+pub struct Statistics {
+  pub queries: AtomicU64,
+  pub success: AtomicU64,
+  pub failed: AtomicU64,
+  pub memory_recv: AtomicU64,
+  pub memory_sent: AtomicU64,
+}
+
 /// DNS Request Handler
 pub struct CheckedAuthority {
   origin: LowerName,
   client: Arc<MemoryClient>,
   _handlers: Vec<tokio::task::JoinHandle<()>>,
+  stats: Arc<Statistics>,
 }
 
 impl CheckedAuthority {
@@ -23,8 +34,10 @@ impl CheckedAuthority {
     let origin = LowerName::new(&Name::root());
     let (rt, sender, receiver) = MemoryRuntime::new();
     let client = client::Vanilla::new(config, rt);
-    let handle = tokio::spawn(async move { memory_to_udp(sender, receiver).await });
-    Self { client: Arc::new(client), origin, _handlers: vec![handle] }
+    let stats = Arc::new(Statistics::default());
+    let stats2 = stats.clone();
+    let handle = tokio::spawn(async move { memory_to_udp(sender, receiver, stats2).await });
+    Self { client: Arc::new(client), origin, _handlers: vec![handle], stats }
   }
 
   pub fn to_boxed(self) -> Box<dyn AuthorityObject> {
@@ -69,8 +82,15 @@ impl Authority for CheckedAuthority {
     request: RequestInfo<'_>,
     lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
-    let _span = info_span!("search", name=%request.query.name(), rtype=?request.query.query_type()); let _span = _span.enter();
-    let result = self.lookup(request.query.name(), RecordType::A, lookup_options).await?;
+    // let _span = info_span!("search", name=%request.query.name(), rtype=?request.query.query_type()); let _span = _span.enter();
+    self.stats.queries.fetch_add(1, Ordering::Relaxed);
+    let result = self.lookup(request.query.name(), request.query.query_type(), lookup_options).await.map_err(|e| {
+      self.stats.failed.fetch_add(1, Ordering::Relaxed); e
+    })?;
+    self.stats.success.fetch_add(1, Ordering::Relaxed);
+    if rand::random::<f64>() < 0.10 {
+      info!(stats=?self.stats);
+    }
     Ok(result)
   }
 
@@ -102,11 +122,11 @@ impl LookupObject for LookupResult {
 }
 
 
-pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>) {
+pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>, stats: Arc<Statistics>) {
   // let mut udp = HashMap::new();
   let mut handles = Vec::new();
   while let Some(packet) = receiver.recv().await {
-    let handle = tokio::spawn(udp_handle(packet, sender.clone()));
+    let handle = tokio::spawn(udp_handle(packet, sender.clone(), stats.clone()));
     handles.push(handle);
     handles = handles.into_iter().filter(|i| !i.is_finished()).collect();
     if handles.len() > 5 {
@@ -115,9 +135,10 @@ pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiv
   }
 }
 
-async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>) {
+async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>, stats: Arc<Statistics>) {
   match packet {
     Packet::Udp { local_addr, remote_addr, buffer } => {
+      stats.memory_recv.fetch_add(1, Ordering::Relaxed);
       let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
       trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
       let socket = tokio::net::UdpSocket::bind(local_addr).await.unwrap();
@@ -142,9 +163,8 @@ async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>) {
           }
         }
       } }
-      if let Some(out_buf) = decided {
-        sender.send(Packet::Udp { local_addr, remote_addr, buffer: out_buf }).await.unwrap();
-      }
+      sender.send(Packet::Udp { local_addr, remote_addr, buffer: decided.unwrap_or_default() }).await.unwrap();
+      stats.memory_sent.fetch_add(1, Ordering::Relaxed);
     },
   }
 }

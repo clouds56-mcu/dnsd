@@ -1,7 +1,7 @@
 use hickory_server::{
   authority::Catalog,
   proto::rr::LowerName,
-  resolver::{system_conf::parse_resolv_conf, Name},
+  resolver::Name,
   ServerFuture,
 };
 
@@ -10,13 +10,15 @@ extern crate tracing;
 
 pub mod client;
 pub mod server;
+pub mod config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
   dotenvy::dotenv().ok();
   tracing_subscriber::fmt::init();
 
-  let conf = parse_resolv_conf("nameserver 1.1.1.1\n nameserver 8.8.8.8\n")?;
+  let conf = resolv_conf::Config::parse(" nameserver 1.1.1.1\n nameserver 8.8.8.8\n").unwrap();
+  let conf = config::config_from_resolv(conf).unwrap();
   info!("parsed config: {:?}", conf.0);
   info!("parsed opts: {:?}", conf.1);
   let authority = server::CheckedAuthority::new(conf);

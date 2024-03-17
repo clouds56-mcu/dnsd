@@ -5,17 +5,17 @@ use hickory_server::proto::rr::{LowerName, Record, RecordType};
 use hickory_server::resolver::{lookup::Lookup, Name};
 use hickory_server::server::RequestInfo;
 
-use crate::client::WindowedUdpClient;
+use crate::client::MemoryClient;
 
 /// DNS Request Handler
 pub struct CheckedAuthority {
   origin: LowerName,
-  client: Arc<WindowedUdpClient>,
+  client: Arc<MemoryClient>,
 }
 
 impl CheckedAuthority {
   /// Create a new Server with the given client
-  pub fn new(client: Arc<WindowedUdpClient>) -> Self {
+  pub fn new(client: Arc<MemoryClient>) -> Self {
     let origin = LowerName::new(&Name::root());
     Self { client, origin }
   }

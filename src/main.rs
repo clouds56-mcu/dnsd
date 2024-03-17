@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{sync::Arc, time::Duration};
 
 use client::memory_rt::Packet;
 use hickory_server::{
@@ -11,30 +11,40 @@ use hickory_server::{
 #[macro_use]
 extern crate tracing;
 
-mod client;
-mod server;
+pub mod client;
+pub mod server;
 
 pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>) {
-  let mut udp = HashMap::new();
+  // let mut udp = HashMap::new();
   while let Some(packet) = receiver.recv().await {
     match packet {
       Packet::Udp { local_addr, remote_addr, buffer } => {
         debug!("[memory] sending {local_addr} {remote_addr} len={}", buffer.len());
         debug!("buffer: {:02x?}", buffer);
-        if !udp.contains_key(&local_addr) {
-          udp.insert(local_addr, tokio::net::UdpSocket::bind(local_addr).await.unwrap());
-        }
-        let socket = udp.get(&local_addr).unwrap();
+        let socket = tokio::net::UdpSocket::bind(local_addr).await.unwrap();
         socket.send_to(&buffer, remote_addr).await.unwrap();
         let mut out_buf = vec![0; 4096];
-        // while let Ok((_, new_addr)) = socket.try_recv(&mut out_buf) {
-
-        // }
-        let (len, new_addr) = socket.recv_from(&mut out_buf).await.unwrap();
-        out_buf.truncate(len);
-        debug!("[memory] receiving {new_addr} {local_addr} len={}", len);
-        debug!("buffer: {:02x?}", out_buf);
-        sender.send(Packet::Udp { local_addr, remote_addr: new_addr, buffer: out_buf }).await.unwrap();
+        let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        let mut decided = None;
+        loop {
+          let sleep = tokio::time::sleep_until(until);
+          tokio::select! {
+          _ = sleep => {
+            warn!("[memory] finished");
+            break;
+          }
+          _ = socket.readable() => {
+            if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
+              debug!("[memory] receiving {new_addr} {local_addr} len={}", len);
+              let out_buf = out_buf[..len].to_owned();
+              debug!("buffer: {:02x?}", out_buf);
+              decided = Some(out_buf);
+            }
+          }
+        } }
+        if let Some(out_buf) = decided {
+          sender.send(Packet::Udp { local_addr, remote_addr, buffer: out_buf }).await.unwrap();
+        }
       },
     }
   }

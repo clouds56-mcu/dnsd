@@ -1,6 +1,6 @@
-use std::{borrow::Borrow, marker::PhantomData, net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{borrow::Borrow, net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use futures::{Future, FutureExt, Stream, StreamExt};
+use futures::{Future, FutureExt, Stream};
 
 use hickory_server::proto::Time;
 use hickory_server::proto::{error::ProtoError, op::{MessageFinalizer, NoopMessageFinalizer}, udp::{DnsUdpSocket, UdpClientConnect, UdpClientStream}, xfer::{DnsRequest, DnsRequestSender, DnsResponse, DnsResponseStream, SerialMessage}};

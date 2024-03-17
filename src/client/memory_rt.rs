@@ -1,8 +1,8 @@
 // https://github.com/hickory-dns/hickory-dns/issues/1669
 
-use std::{collections::{HashMap, VecDeque}, io::{self, Write}, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, task::{ready, Context, Poll}};
+use std::{collections::{HashMap, VecDeque}, io::{self, Write}, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, task::{Context, Poll}};
 
-use hickory_server::{proto::{self, udp::UdpSocket as _, TokioTime}, resolver::{name_server::{GenericConnector, RuntimeProvider, Spawn}, TokioHandle}};
+use hickory_server::{proto::{self, TokioTime}, resolver::{name_server::{GenericConnector, RuntimeProvider, Spawn}, TokioHandle}};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 pub type MemoryState = HashMap<SocketAddr, Mutex<VecDeque<Packet>>>;
@@ -108,12 +108,8 @@ impl proto::udp::UdpSocket for UdpSocket {
     Ok(socket)
   }
 
-  async fn bind(addr: SocketAddr) -> io::Result<Self> {
-    Ok(UdpSocket {
-      sender: todo!(),
-      received: todo!(),
-      addr: todo!(),
-    })
+  async fn bind(_addr: SocketAddr) -> io::Result<Self> {
+    todo!()
   }
 }
 
@@ -121,7 +117,7 @@ impl proto::udp::UdpSocket for UdpSocket {
 impl proto::udp::DnsUdpSocket for UdpSocket {
   type Time = proto::TokioTime;
 
-  fn poll_recv_from(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<(usize, SocketAddr)>> {
+  fn poll_recv_from(&self, _cx: &mut Context<'_>, _buff: &mut [u8]) -> Poll<io::Result<(usize, SocketAddr)>> {
     // let mut buf = tokio::io::ReadBuf::new(buf);
     // let addr = ready!(self.raw.poll_recv_from(cx, &mut buf))?;
     // let len = buf.filled().len();
@@ -136,7 +132,7 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
       if let Some(entry) = state.get(&self.addr) {
         if let Some(item) = entry.lock().await.pop_front() {
           match item {
-            Packet::Udp { local_addr, remote_addr, buffer } => {
+            Packet::Udp { local_addr: _, remote_addr, buffer } => {
               buf.write_all(&buffer)?;
               return Ok((buffer.len(), remote_addr))
             },
@@ -146,7 +142,7 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
     }
   }
 
-  fn poll_send_to(&self, cx: &mut Context<'_>, buf: &[u8], target: SocketAddr) -> Poll<io::Result<usize>> {
+  fn poll_send_to(&self, _cx: &mut Context<'_>, _buf: &[u8], _target: SocketAddr) -> Poll<io::Result<usize>> {
     // self.raw.poll_send_to(cx, buf, target)
     todo!();
   }

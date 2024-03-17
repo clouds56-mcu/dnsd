@@ -1,18 +1,17 @@
-
-
 use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use futures::{future::FutureExt, Stream, StreamExt as _};
 
+use hickory_server::proto::error::ProtoError;
 use hickory_server::proto::op::NoopMessageFinalizer;
-use hickory_server::proto::udp::{UdpClientConnect, UdpClientStream};
-use hickory_server::proto::xfer::{DnsExchange, DnsExchangeConnect, DnsExchangeSend, DnsHandle, DnsRequest, DnsResponse};
-use hickory_server::proto::TokioTime;
+// use hickory_server::proto::udp::{DnsUdpSocket, UdpClientConnect, UdpClientStream};
+use hickory_server::proto::xfer::{DnsExchange, DnsExchangeBackground, DnsExchangeConnect, DnsExchangeSend, DnsHandle, DnsRequest, DnsResponse};
 use hickory_server::resolver::config::{NameServerConfig, Protocol, ResolverOpts};
 use hickory_server::resolver::error::ResolveError;
 use hickory_server::resolver::name_server::{ConnectionProvider, GenericConnector, RuntimeProvider, Spawn, TokioRuntimeProvider};
 use hickory_server::resolver::TokioHandle;
-use tokio::net::UdpSocket;
+
+use super::udp_stream::{StateUdpConnect, StateUdpStream};
 
 #[derive(Clone)]
 pub struct TimeWindowUdpProvider {
@@ -38,9 +37,16 @@ impl TimeWindowUdpProvider {
   }
 }
 
+type UdpClientStream<S> = StateUdpStream<S>;
+type UdpClientConnect<S> = StateUdpConnect<S>;
+
+// type UdpClientStream<S> = hickory_server::proto::udp::UdpClientStream<S>;
+// type UdpClientConnect<S> = hickory_server::proto::udp::UdpClientConnect<S>;
+type ConnectionConnect<R = TokioRuntimeProvider> = DnsExchangeConnect<UdpClientConnect<<R as RuntimeProvider>::Udp>, UdpClientStream<<R as RuntimeProvider>::Udp>, <R as RuntimeProvider>::Timer>;
+type ConnectionBackgroud<R = TokioRuntimeProvider> = DnsExchangeBackground<UdpClientStream<<R as RuntimeProvider>::Udp>, <R as RuntimeProvider>::Timer>;
 impl ConnectionProvider for TimeWindowUdpProvider {
   type Conn = GenericConnection;
-  type FutureConn = TimeWindowUdpConnection;
+  type FutureConn = ConnectionFuture<ConnectionConnect>;
   type RuntimeProvider = TokioRuntimeProvider;
 
   fn new_connection(&self, config: &NameServerConfig, options: &ResolverOpts) -> Self::FutureConn {
@@ -57,7 +63,7 @@ impl ConnectionProvider for TimeWindowUdpProvider {
             Arc::new(closure),
         );
         let exchange = DnsExchange::connect(stream);
-        TimeWindowUdpConnection {
+        ConnectionFuture {
           inner: exchange,
           spawner: self.runtime_provider.create_handle(),
         }
@@ -103,12 +109,15 @@ impl DnsHandle for GenericConnection {
 }
 
 // #[derive(Clone)]
-pub struct TimeWindowUdpConnection {
-  inner: DnsExchangeConnect<UdpClientConnect<UdpSocket>, UdpClientStream<UdpSocket>, TokioTime>,
+pub struct ConnectionFuture<Conn> {
+  inner: Conn,
   spawner: TokioHandle,
 }
 
-impl Future for TimeWindowUdpConnection {
+impl<Conn> Future for ConnectionFuture<Conn>
+where
+  Conn: Future<Output=Result<(DnsExchange, ConnectionBackgroud), ProtoError>> + Unpin,
+{
   type Output = Result<GenericConnection, ResolveError>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {

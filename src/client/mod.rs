@@ -3,6 +3,7 @@ use hickory_server::resolver::name_server::TokioConnectionProvider;
 pub mod vanilla;
 pub mod window;
 pub mod udp;
+pub mod udp_stream;
 
 pub use window::TimeWindowUdpProvider;
 

@@ -37,11 +37,11 @@ impl TimeWindowUdpProvider {
   }
 }
 
-type UdpClientStream<S> = StateUdpStream<S>;
-type UdpClientConnect<S> = StateUdpConnect<S>;
+// type UdpClientStream<S> = StateUdpStream<S>;
+// type UdpClientConnect<S> = StateUdpConnect<S>;
 
-// type UdpClientStream<S> = hickory_server::proto::udp::UdpClientStream<S>;
-// type UdpClientConnect<S> = hickory_server::proto::udp::UdpClientConnect<S>;
+type UdpClientStream<S> = hickory_server::proto::udp::UdpClientStream<S>;
+type UdpClientConnect<S> = hickory_server::proto::udp::UdpClientConnect<S>;
 type ConnectionConnect<R = TokioRuntimeProvider> = DnsExchangeConnect<UdpClientConnect<<R as RuntimeProvider>::Udp>, UdpClientStream<<R as RuntimeProvider>::Udp>, <R as RuntimeProvider>::Timer>;
 type ConnectionBackgroud<R = TokioRuntimeProvider> = DnsExchangeBackground<UdpClientStream<<R as RuntimeProvider>::Udp>, <R as RuntimeProvider>::Timer>;
 impl ConnectionProvider for TimeWindowUdpProvider {

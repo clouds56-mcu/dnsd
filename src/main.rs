@@ -11,6 +11,7 @@ extern crate tracing;
 pub mod client;
 pub mod server;
 pub mod config;
+pub mod memory_socket;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

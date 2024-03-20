@@ -1,15 +1,16 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use hickory_server::authority::{Authority, AuthorityObject, LookupError, LookupObject, LookupOptions, MessageRequest, UpdateResult, ZoneType};
 use hickory_server::proto::rr::{LowerName, Record, RecordType};
 use hickory_server::resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_server::resolver::{lookup::Lookup, Name};
 use hickory_server::server::RequestInfo;
+use tokio::sync::Mutex;
 
-use crate::client::memory_rt::Packet;
 use crate::client::{self, MemoryClient, MemoryRuntime};
+use crate::memory_socket::memory_to_udp;
 
 #[derive(Debug, Default)]
 pub struct Statistics {
@@ -22,12 +23,22 @@ pub struct Statistics {
   pub memory_sent: AtomicU64,
 }
 
+pub struct DomainStats {
+  pub queries: AtomicU64,
+  pub success: AtomicU64,
+  pub suspect: AtomicU64,
+  pub failed: AtomicU64,
+  pub empty: AtomicU64,
+}
+
 /// DNS Request Handler
 pub struct CheckedAuthority {
   origin: LowerName,
   client: Arc<MemoryClient>,
-  _handlers: Vec<tokio::task::JoinHandle<()>>,
   stats: Arc<Statistics>,
+  // TODO: split to lockfree
+  high_risk_domain: Arc<Mutex<HashMap<Name, DomainStats>>>,
+  _handlers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl CheckedAuthority {
@@ -36,10 +47,22 @@ impl CheckedAuthority {
     let origin = LowerName::new(&Name::root());
     let (rt, sender, receiver) = MemoryRuntime::new();
     let client = client::Vanilla::new(config, rt);
+
     let stats = Arc::new(Statistics::default());
     let stats2 = stats.clone();
-    let handle = tokio::spawn(async move { memory_to_udp(sender, receiver, stats2).await });
-    Self { client: Arc::new(client), origin, _handlers: vec![handle], stats }
+    let high_risk_domain = Arc::new(Mutex::new(HashMap::new()));
+    let high_risk_domain2 = high_risk_domain.clone();
+
+    // Start the UDP handler
+    let handle_udp = tokio::spawn(async move { memory_to_udp(sender, receiver, stats2, high_risk_domain2).await });
+
+    Self {
+      client: Arc::new(client),
+      origin,
+      stats,
+      high_risk_domain,
+      _handlers: vec![handle_udp],
+    }
   }
 
   pub fn to_boxed(self) -> Box<dyn AuthorityObject> {
@@ -126,79 +149,6 @@ impl LookupObject for LookupResult {
 }
 
 
-pub async fn memory_to_udp(sender: tokio::sync::mpsc::Sender<Packet>, mut receiver: tokio::sync::mpsc::Receiver<Packet>, stats: Arc<Statistics>) {
-  // let mut udp = HashMap::new();
-  let mut last_handles_report = tokio::time::Instant::now();
-  let mut handles = Vec::new();
-  while let Some(packet) = receiver.recv().await {
-    let handle = tokio::spawn(udp_handle(packet, sender.clone(), stats.clone()));
-    handles.push(handle);
-    handles = handles.into_iter().filter(|i| !i.is_finished()).collect();
-    if last_handles_report.elapsed() > Duration::from_secs(5) {
-      let pending = stats.queries.load(Ordering::Relaxed).saturating_sub(stats.success.load(Ordering::Relaxed)).saturating_sub(stats.failed.load(Ordering::Relaxed));
-      last_handles_report = tokio::time::Instant::now();
-      if handles.len() > 5 {
-        warn!(handles.len=handles.len(), pending, ?stats)
-      } else {
-        info!(handles.len=handles.len(), pending, ?stats)
-      }
-    } else {
-      trace!(handles.len=handles.len())
-    }
-  }
-}
-
-async fn udp_handle(packet: Packet, sender: tokio::sync::mpsc::Sender<Packet>, stats: Arc<Statistics>) -> () {
-  let mut decided = None;
-  let packet = 'failed: loop {
-    match packet {
-      Packet::Udp { local_addr, remote_addr, buffer } => {
-        stats.memory_recv.fetch_add(1, Ordering::Relaxed);
-        let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
-        trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
-        let Ok(socket) = tokio::net::UdpSocket::bind(local_addr).await else {
-          break 'failed Packet::Udp { local_addr, remote_addr, buffer: vec![] };
-        };
-        if socket.send_to(&buffer, remote_addr).await.is_err() {
-          break 'failed Packet::Udp { local_addr, remote_addr, buffer: vec![] };
-        }
-        let mut out_buf = vec![0; 4096];
-        let until = tokio::time::Instant::now().checked_add(Duration::from_secs(1)).unwrap();
-
-        let mut found = 0;
-        loop {
-          let sleep = tokio::time::sleep_until(until);
-          tokio::select! {
-            _ = sleep => {
-              if found > 1 {
-                info!(name: "finished", response_found=found);
-              }
-              trace!(name: "time up", response_found=found, overtime_ms=until.elapsed().as_millis());
-              break;
-            }
-            _ = socket.readable() => {
-              if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
-                trace!(name: "receiving", %new_addr, %local_addr, len);
-                let out_buf = out_buf[..len].to_owned();
-                decided = Some(out_buf);
-                found += 1;
-              }
-            }
-          }
-        }
-        if sender.send(Packet::Udp { local_addr, remote_addr, buffer: decided.unwrap_or_default() }).await.is_err() {
-          stats.memory_sent.fetch_add(1, Ordering::Relaxed);
-          return;
-        }
-        stats.memory_sent.fetch_add(1, Ordering::Relaxed);
-      },
-    }
-
-    return;
-  };
-  stats.memory_failed.fetch_add(1, Ordering::Relaxed);
-  sender.send(packet).await.ok();
-}
 
 #[cfg(test)]
 mod tests {

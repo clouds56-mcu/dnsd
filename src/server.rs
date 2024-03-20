@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hickory_server::authority::{Authority, AuthorityObject, LookupError, LookupObject, LookupOptions, MessageRequest, UpdateResult, ZoneType};
@@ -23,12 +23,89 @@ pub struct Statistics {
   pub memory_sent: AtomicU64,
 }
 
-pub struct DomainStats {
+#[derive(Debug, Default)]
+pub struct StatsPerDomain {
   pub queries: AtomicU64,
   pub success: AtomicU64,
   pub suspect: AtomicU64,
   pub failed: AtomicU64,
   pub empty: AtomicU64,
+  pub refresh_needed: AtomicBool,
+}
+
+pub struct DomainStats(Mutex<HashMap<Name, StatsPerDomain>>);
+
+impl DomainStats {
+  pub fn new() -> Self {
+    Self(Mutex::new(HashMap::new()))
+  }
+
+  pub async fn check(&self, name: &Name) -> bool {
+    let stats = self.0.lock().await;
+    let entry = stats.get(name);
+    if let Some(entry) = entry {
+      if entry.refresh_needed.load(Ordering::SeqCst) {
+        return true;
+      }
+      let suspect = entry.suspect.load(Ordering::Relaxed);
+      let success = entry.success.load(Ordering::Relaxed);
+      // at least 1/10 of query is suspect
+      if suspect > success / 9 {
+        return true;
+      } else if suspect > 0 {
+        debug!(action="check", %name, suspect, success);
+      }
+    }
+    false
+  }
+
+  pub async fn refresh_needed(&self, name: &Name, reset: bool) -> bool {
+    let stats = self.0.lock().await;
+    let entry = stats.get(name);
+    if let Some(entry) = entry {
+      return entry.refresh_needed.fetch_and(!reset, Ordering::SeqCst);
+    }
+    false
+  }
+
+  pub async fn need_refresh(&self, name: &Name, value: bool) {
+    let mut stats = self.0.lock().await;
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.refresh_needed.store(value, Ordering::SeqCst);
+  }
+
+  pub async fn add_query(&self, name: &Name, force: bool) -> u64 {
+    let mut stats = self.0.lock().await;
+    if !force && !stats.contains_key(name) { return 0 }
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.queries.fetch_add(1, Ordering::Relaxed)
+  }
+
+  pub async fn add_success(&self, name: &Name, force: bool) -> u64 {
+    let mut stats = self.0.lock().await;
+    if !force && !stats.contains_key(name) { return 0 }
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.success.fetch_add(1, Ordering::Relaxed) + 1
+  }
+
+  pub async fn add_suspect(&self, name: &Name) -> u64 {
+    let mut stats = self.0.lock().await;
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.suspect.fetch_add(1, Ordering::Relaxed) + 1
+  }
+
+  pub async fn add_failed(&self, name: &Name) -> u64 {
+    let mut stats = self.0.lock().await;
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.failed.fetch_add(1, Ordering::Relaxed) + 1
+  }
+
+  pub async fn add_empty(&self, name: &Name, force: bool) -> u64 {
+    let mut stats = self.0.lock().await;
+    if !force && !stats.contains_key(name) { return 0 }
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.empty.fetch_add(1, Ordering::Relaxed) + 1
+  }
 }
 
 /// DNS Request Handler
@@ -37,7 +114,7 @@ pub struct CheckedAuthority {
   client: Arc<MemoryClient>,
   stats: Arc<Statistics>,
   // TODO: split to lockfree
-  high_risk_domain: Arc<Mutex<HashMap<Name, DomainStats>>>,
+  high_risk_domain: Arc<DomainStats>,
   _handlers: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -50,7 +127,7 @@ impl CheckedAuthority {
 
     let stats = Arc::new(Statistics::default());
     let stats2 = stats.clone();
-    let high_risk_domain = Arc::new(Mutex::new(HashMap::new()));
+    let high_risk_domain = Arc::new(DomainStats::new());
     let high_risk_domain2 = high_risk_domain.clone();
 
     // Start the UDP handler
@@ -97,9 +174,11 @@ impl Authority for CheckedAuthority {
     _lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
     let now = tokio::time::Instant::now();
-    let result = self.client.resolve(&name.to_string(), rtype).await?;
+    let force = self.high_risk_domain.refresh_needed(&name.clone().into(), true).await;
+    let result = self.client.resolve(&name.to_string(), rtype, force).await?;
     if result.records().is_empty() {
       self.stats.empty.fetch_add(1, Ordering::Relaxed);
+      self.high_risk_domain.add_empty(&name.clone().into(), false).await;
       info!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
     } else {
       debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), record=%result.records()[0], elapsed=%now.elapsed().as_millis());
@@ -114,10 +193,17 @@ impl Authority for CheckedAuthority {
   ) -> Result<Self::Lookup, LookupError> {
     // let _span = info_span!("search", name=%request.query.name(), rtype=?request.query.query_type()); let _span = _span.enter();
     self.stats.queries.fetch_add(1, Ordering::Relaxed);
-    let result = self.lookup(request.query.name(), request.query.query_type(), lookup_options).await.map_err(|e| {
-      self.stats.failed.fetch_add(1, Ordering::Relaxed); e
-    })?;
+    self.high_risk_domain.add_query(&request.query.name().clone().into(), false).await;
+    let result = match self.lookup(request.query.name(), request.query.query_type(), lookup_options).await {
+      Ok(result) => result,
+      Err(e) => {
+        self.stats.failed.fetch_add(1, Ordering::Relaxed);
+        self.high_risk_domain.add_failed(&request.query.name().clone().into()).await;
+        return Err(e)?
+      }
+    };
     self.stats.success.fetch_add(1, Ordering::Relaxed);
+    self.high_risk_domain.add_success(&request.query.name().clone().into(), false).await;
     Ok(result)
   }
 

@@ -2,7 +2,7 @@
 
 use std::{collections::{HashMap, VecDeque}, io::{self, Write}, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, task::{Context, Poll}, time::Duration};
 
-use hickory_server::{proto::{self, TokioTime}, resolver::{name_server::{GenericConnector, RuntimeProvider, Spawn}, TokioHandle}};
+use hickory_server::{proto::{self, op::Message, rr::RecordType, TokioTime}, resolver::{name_server::{GenericConnector, RuntimeProvider, Spawn}, Name, TokioHandle}};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 pub struct MemoryBuffer {
@@ -104,10 +104,24 @@ pub enum Packet {
   Udp {
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
+    query: Option<(Name, RecordType)>,
     buffer: Vec<u8>,
   }
 }
 
+impl std::fmt::Display for Packet {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Packet::Udp { local_addr, remote_addr, query, buffer } => {
+        write!(f, "Udp({local_addr} => {remote_addr}, ")?;
+        if let Some((name, rtype)) = query {
+          write!(f, "query={name}, rtype={rtype}, ")?;
+        }
+        write!(f, "len={})", buffer.len())
+      }
+    }
+  }
+}
 
 pub struct UdpSocket {
   addr: SocketAddr,
@@ -165,7 +179,7 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
       if let Some(entry) = state.get(&self.addr) {
         if let Some(item) = entry.queue.lock().await.pop_front() {
           match item {
-            Packet::Udp { local_addr: _, remote_addr, buffer } => {
+            Packet::Udp { local_addr: _, remote_addr, buffer, .. } => {
               buf.write_all(&buffer)?;
               return Ok((buffer.len(), remote_addr))
             },
@@ -185,7 +199,17 @@ impl proto::udp::DnsUdpSocket for UdpSocket {
     if let Some(state) = self.received.read().await.get(&self.addr) {
       *state.last_used.lock().await = tokio::time::Instant::now();
     }
-    self.sender.send(Packet::Udp { local_addr: self.addr, remote_addr: target, buffer: buf.to_owned() }).await.map_err(|_| io::ErrorKind::UnexpectedEof)?;
+    // parse buf for query
+    let query = match Message::from_vec(buf).ok().as_ref().and_then(|msg| msg.query()) {
+      Some(query) => {
+        Some((query.name().clone(), query.query_type()))
+      },
+      None => {
+        warn!("cannot parse message from buffer");
+        None
+      }
+    };
+    self.sender.send(Packet::Udp { local_addr: self.addr, remote_addr: target, query, buffer: buf.to_owned() }).await.map_err(|_| io::ErrorKind::UnexpectedEof)?;
     Ok(buf.len())
   }
 }

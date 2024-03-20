@@ -42,7 +42,12 @@ impl<P: ConnectionProvider> Client<P> {
     &self,
     domain: &str,
     record_type: RecordType,
+    force: bool,
   ) -> Result<Lookup, ResolveError> {
+    if force {
+      error!(action="force lookup", domain, ?record_type);
+      self.resolver.clear_cache();
+    }
     let response = self.resolver.lookup(domain, record_type).await?;
     for i in response.record_iter() {
       trace!("resolve {}: {}", domain, i);

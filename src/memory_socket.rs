@@ -83,7 +83,7 @@ async fn udp_handle(
 
         if !high_risk {
           // TODO: cache result
-          let (found, _) = last_packet(Duration::from_secs(1), &socket, local_addr).await;
+          let (found, _) = last_packet(Duration::from_secs(3), &socket, local_addr).await;
           if found > 0 && query.is_some() {
             let name = &query.as_ref().unwrap().0;
             warn!(action="suspect after send", found, query=%name);

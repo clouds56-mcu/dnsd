@@ -176,12 +176,14 @@ impl Authority for CheckedAuthority {
     let now = tokio::time::Instant::now();
     let force = self.high_risk_domain.refresh_needed(&name.clone().into(), true).await;
     let result = self.client.resolve(&name.to_string(), rtype, force).await?;
-    if result.records().is_empty() {
-      self.stats.empty.fetch_add(1, Ordering::Relaxed);
-      self.high_risk_domain.add_empty(&name.clone().into(), false).await;
-      info!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
-    } else {
-      debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), record=%result.records()[0], elapsed=%now.elapsed().as_millis());
+    if rtype == RecordType::A || rtype == RecordType::AAAA {
+      if result.records().is_empty() {
+        self.stats.empty.fetch_add(1, Ordering::Relaxed);
+        self.high_risk_domain.add_empty(&name.clone().into(), false).await;
+        info!(func="lookup", %name, ?rtype, records.len=?result.records().len(), elapsed=%now.elapsed().as_millis());
+      } else {
+        debug!(func="lookup", %name, ?rtype, records.len=?result.records().len(), record=%result.records()[0], elapsed=%now.elapsed().as_millis());
+      }
     }
     Ok(LookupResult(result))
   }

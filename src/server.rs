@@ -40,6 +40,11 @@ impl DomainStats {
     Self(Mutex::new(HashMap::new()))
   }
 
+  pub fn try_get_count(&self) -> Option<usize> {
+    let stats = self.0.try_lock().ok()?;
+    Some(stats.len())
+  }
+
   pub async fn check(&self, name: &Name) -> bool {
     let stats = self.0.lock().await;
     let entry = stats.get(name);

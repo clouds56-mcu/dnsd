@@ -19,15 +19,17 @@ pub async fn memory_to_udp(
   let mut handles = Vec::new();
   while let Some(packet) = receiver.recv().await {
     let handle = tokio::spawn(udp_handle(packet, sender.clone(), stats.clone(), high_risk_domain.clone()));
-    handles.push(handle);
-    handles = handles.into_iter().filter(|i| !i.is_finished()).collect();
+    let now = tokio::time::Instant::now();
+    handles.push((handle, now.checked_add(Duration::from_secs(5)).unwrap()));
+    handles = handles.into_iter().filter(|i| !i.0.is_finished() && i.1 > now).collect();
     if last_handles_report.elapsed() > Duration::from_secs(5) {
       let pending = stats.queries.load(Ordering::Relaxed).saturating_sub(stats.success.load(Ordering::Relaxed)).saturating_sub(stats.failed.load(Ordering::Relaxed));
       last_handles_report = tokio::time::Instant::now();
+      let high_risk_count = high_risk_domain.try_get_count();
       if handles.len() > 5 {
-        warn!(handles.len=handles.len(), pending, ?stats)
+        info!(handles.len=handles.len(), pending, ?stats, ?high_risk_count)
       } else {
-        info!(handles.len=handles.len(), pending, ?stats)
+        debug!(handles.len=handles.len(), pending, ?stats, ?high_risk_count)
       }
     } else {
       trace!(handles.len=handles.len())
@@ -83,10 +85,10 @@ async fn udp_handle(
 
         if !high_risk {
           // TODO: cache result
-          let (found, _) = last_packet(Duration::from_secs(3), &socket, local_addr).await;
-          if found > 0 && query.is_some() {
+          let mut out_buf = vec![0; 4096];
+          if socket.recv_from(&mut out_buf).await.is_ok() && query.is_some() {
             let name = &query.as_ref().unwrap().0;
-            warn!(action="suspect after send", found, query=%name);
+            warn!(action="suspect after send", query=%name);
             high_risk_domain.add_suspect(&name).await;
             high_risk_domain.need_refresh(&name, true).await;
           }

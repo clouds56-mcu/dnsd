@@ -1,5 +1,5 @@
 
-use std::{sync::{atomic::Ordering, Arc}, time::Duration};
+use std::{sync::{atomic::{AtomicUsize, Ordering}, Arc}, time::Duration};
 
 use crate::{client::memory_rt::Packet, server::{DomainStats, Statistics}};
 
@@ -106,27 +106,18 @@ async fn udp_handle(
 async fn last_packet(duration: Duration, socket: &tokio::net::UdpSocket, local_addr: std::net::SocketAddr) -> (usize, Option<Vec<u8>>) {
   let mut decided = None;
   let mut out_buf = vec![0; 4096];
-  let mut found = 0;
-  let until = tokio::time::Instant::now().checked_add(duration).unwrap();
-  loop {
-    let sleep = tokio::time::sleep_until(until);
-    tokio::select! {
-      _ = sleep => {
-        if found > 1 {
-          info!(name: "finished", response_found=found);
-        }
-        trace!(name: "time up", response_found=found, overtime_ms=until.elapsed().as_millis());
-        break;
-      }
-      _ = socket.readable() => {
-        if let Ok((len, new_addr)) = socket.try_recv_from(&mut out_buf) {
-          trace!(name: "receiving", %new_addr, %local_addr, len);
-          let out_buf = out_buf[..len].to_owned();
-          decided = Some(out_buf);
-          found += 1;
-        }
-      }
+  let found = AtomicUsize::new(0);
+  tokio::time::timeout(duration, async {
+    while let Some((len, new_addr)) = socket.recv_from(&mut out_buf).await.ok() {
+      trace!(name: "receiving", %new_addr, %local_addr, len);
+      let out_buf = out_buf[..len].to_owned();
+      decided = Some(out_buf);
+      found.fetch_add(1, Ordering::SeqCst);
     }
+  }).await.ok();
+  let found = found.load(Ordering::SeqCst);
+  if found > 1 {
+    info!(action="last_packet", found);
   }
   return (found, decided);
 }

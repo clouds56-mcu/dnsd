@@ -21,7 +21,11 @@ pub async fn memory_to_udp(
     let handle = tokio::spawn(udp_handle(packet, sender.clone(), stats.clone(), high_risk_domain.clone()));
     let now = tokio::time::Instant::now();
     handles.push((handle, now.checked_add(Duration::from_secs(5)).unwrap()));
-    handles = handles.into_iter().filter(|i| !i.0.is_finished() && i.1 > now).collect();
+    handles = handles.into_iter().filter(|i| {
+      let live = !i.0.is_finished() && i.1 > now;
+      if !live { i.0.abort() }
+      live
+    }).collect();
     if last_handles_report.elapsed() > Duration::from_secs(5) {
       let pending = stats.queries.load(Ordering::Relaxed).saturating_sub(stats.success.load(Ordering::Relaxed)).saturating_sub(stats.failed.load(Ordering::Relaxed));
       last_handles_report = tokio::time::Instant::now();

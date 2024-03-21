@@ -5,11 +5,12 @@ use std::sync::Arc;
 use hickory_server::authority::{Authority, AuthorityObject, LookupError, LookupObject, LookupOptions, MessageRequest, UpdateResult, ZoneType};
 use hickory_server::proto::rr::{LowerName, Record, RecordType};
 use hickory_server::resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_server::resolver::name_server::TokioConnectionProvider;
 use hickory_server::resolver::{lookup::Lookup, Name};
 use hickory_server::server::RequestInfo;
 use tokio::sync::Mutex;
 
-use crate::client::{self, MemoryClient, MemoryRuntime};
+use crate::client::{self, MemoryClient, MemoryRuntime, VanillaClient};
 use crate::memory_socket::memory_to_udp;
 
 #[derive(Debug, Default)]
@@ -117,6 +118,7 @@ impl DomainStats {
 pub struct CheckedAuthority {
   origin: LowerName,
   client: Arc<MemoryClient>,
+  vanilla_client: Arc<VanillaClient>,
   stats: Arc<Statistics>,
   // TODO: split to lockfree
   high_risk_domain: Arc<DomainStats>,
@@ -128,7 +130,8 @@ impl CheckedAuthority {
   pub fn new(config: (ResolverConfig, ResolverOpts)) -> Self {
     let origin = LowerName::new(&Name::root());
     let (rt, sender, receiver) = MemoryRuntime::new();
-    let client = client::Vanilla::new(config, rt);
+    let client = client::MemoryClient::new(config.clone(), rt);
+    let vanilla_client = client::VanillaClient::new(config, TokioConnectionProvider::default());
 
     let stats = Arc::new(Statistics::default());
     let stats2 = stats.clone();
@@ -140,6 +143,7 @@ impl CheckedAuthority {
 
     Self {
       client: Arc::new(client),
+      vanilla_client: Arc::new(vanilla_client),
       origin,
       stats,
       high_risk_domain,
@@ -199,6 +203,13 @@ impl Authority for CheckedAuthority {
     lookup_options: LookupOptions,
   ) -> Result<Self::Lookup, LookupError> {
     // let _span = info_span!("search", name=%request.query.name(), rtype=?request.query.query_type()); let _span = _span.enter();
+    match request.query.query_type() {
+      RecordType::A | RecordType::AAAA | RecordType::CNAME | RecordType::ANAME => {}
+      _ => {
+        let result = self.vanilla_client.resolve(&request.query.name().to_string(), request.query.query_type(), false).await?;
+        return Ok(LookupResult(result))
+      }
+    }
     self.stats.queries.fetch_add(1, Ordering::Relaxed);
     self.high_risk_domain.add_query(&request.query.name().clone().into(), false).await;
     let result = match self.lookup(request.query.name(), request.query.query_type(), lookup_options).await {

@@ -28,6 +28,7 @@ pub struct Statistics {
 pub struct StatsPerDomain {
   pub queries: AtomicU64,
   pub success: AtomicU64,
+  pub checking: AtomicU64,
   pub suspect: AtomicU64,
   pub failed: AtomicU64,
   pub empty: AtomicU64,
@@ -36,14 +37,25 @@ pub struct StatsPerDomain {
 
 pub struct DomainStats(Mutex<HashMap<Name, StatsPerDomain>>);
 
+pub fn is_high_risk(suspect: u64, checking: u64) -> bool {
+  // at least 1/10 of query is suspect
+  match suspect {
+    0 => false,
+    i if i < 10 => suspect > checking / 10,
+    i if i < 100 => suspect > checking / 100,
+    _ => true,
+  }
+}
+
 impl DomainStats {
   pub fn new() -> Self {
     Self(Mutex::new(HashMap::new()))
   }
 
-  pub fn try_get_count(&self) -> Option<usize> {
+  pub fn try_get_count(&self) -> Option<(usize, usize)> {
     let stats = self.0.try_lock().ok()?;
-    Some(stats.len())
+    let high_risk_count = stats.values().filter(|i| is_high_risk(i.suspect.load(Ordering::Relaxed), i.checking.load(Ordering::Relaxed))).count();
+    Some((high_risk_count, stats.len()))
   }
 
   pub async fn check(&self, name: &Name) -> bool {
@@ -54,13 +66,13 @@ impl DomainStats {
         return true;
       }
       let suspect = entry.suspect.load(Ordering::Relaxed);
-      let success = entry.success.load(Ordering::Relaxed);
-      // at least 1/10 of query is suspect
-      if suspect > success / 9 {
-        return true;
-      } else if suspect > 0 {
-        debug!(action="check", %name, suspect, success);
+      let checking = entry.checking.load(Ordering::Relaxed);
+
+      let result = is_high_risk(suspect, checking);
+      if !result && suspect > 0 {
+        debug!(action="check", %name, suspect, checking);
       }
+      return result;
     }
     false
   }
@@ -94,7 +106,16 @@ impl DomainStats {
     entry.success.fetch_add(1, Ordering::Relaxed) + 1
   }
 
-  pub async fn add_suspect(&self, name: &Name) -> u64 {
+  pub async fn add_checking(&self, name: Option<&Name>, force: bool) -> u64 {
+    let Some(name) = name else { return 0 };
+    let mut stats = self.0.lock().await;
+    if !force && !stats.contains_key(name) { return 0 }
+    let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
+    entry.checking.fetch_add(1, Ordering::Relaxed) + 1
+  }
+
+  pub async fn add_suspect(&self, name: Option<&Name>) -> u64 {
+    let Some(name) = name else { return 0 };
     let mut stats = self.0.lock().await;
     let entry = stats.entry(name.clone()).or_insert_with(StatsPerDomain::default);
     entry.suspect.fetch_add(1, Ordering::Relaxed) + 1

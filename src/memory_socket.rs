@@ -52,6 +52,7 @@ async fn udp_handle(
     match packet {
       Packet::Udp { local_addr, remote_addr, buffer, query } => {
         stats.memory_recv.fetch_add(1, Ordering::Relaxed);
+        let query_name = query.as_ref().map(|i| &i.0);
         let span = trace_span!("[memory]", port=local_addr.port()); let _span = span.enter();
         trace!(name: "sending", %local_addr, %remote_addr, len=buffer.len());
         let Ok(socket) = tokio::net::UdpSocket::bind(local_addr).await else {
@@ -66,11 +67,12 @@ async fn udp_handle(
         } else {
           false
         };
+        high_risk_domain.add_checking(query_name, false).await;
         // TODO: parse query from out_buf
         let decided = if high_risk {
           let (found, decided) = last_packet(Duration::from_secs(1), &socket, local_addr).await;
-          if found > 1 && query.is_some() {
-            high_risk_domain.add_suspect(&query.as_ref().unwrap().0).await;
+          if found > 1 {
+            high_risk_domain.add_suspect(query_name).await;
           }
           decided
         } else {
@@ -90,11 +92,10 @@ async fn udp_handle(
         if !high_risk {
           // TODO: cache result
           let mut out_buf = vec![0; 4096];
-          if socket.recv_from(&mut out_buf).await.is_ok() && query.is_some() {
-            let name = &query.as_ref().unwrap().0;
-            warn!(action="suspect after send", query=%name);
-            high_risk_domain.add_suspect(&name).await;
-            high_risk_domain.need_refresh(&name, true).await;
+          if socket.recv_from(&mut out_buf).await.is_ok() && query_name.is_some() {
+            warn!(action="suspect after send", query=%query_name.unwrap());
+            high_risk_domain.add_suspect(query_name).await;
+            high_risk_domain.need_refresh(query_name.unwrap(), true).await;
           }
         }
       },
